@@ -1,9 +1,78 @@
 import streamlit as st
 import pandas as pd
 import re
-import os
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 st.title("Property Listing Parser")
+
+COLUMNS = [
+    "Project",
+    "Address",
+    "Area",
+    "Nearest MRT",
+    "Price",
+    "Size",
+    "PSF",
+    "Bedrooms",
+    "Bathrooms",
+    "Tenure",
+    "TOP",
+    "Developer",
+    "Total Units",
+    "URL",
+    "Status",
+    "Viewing Date",
+    "Remarks"
+]
+
+
+def clean_propertyguru_url(url):
+    if not url:
+        return ""
+
+    m = re.search(
+        r"(https://www\.propertyguru\.com\.sg/listing/for-sale-[a-z0-9\-]+-\d+)",
+        url,
+        re.IGNORECASE
+    )
+    if m:
+        return m.group(1)
+
+    # fallback: remove query string
+    return url.split("?")[0].strip()
+
+
+def save_to_gsheet(data):
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive"
+    ]
+
+    creds = ServiceAccountCredentials.from_json_keyfile_name(
+        "credentials.json", scope
+    )
+
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key("11z6lns3BXO4hc_nabl_-9ugt_L9FdRMxGpBZ5lWJWS8").worksheet("te-lv")
+
+    values = sheet.get_all_values()
+
+    # 如果第一行不是 header，就自动补 header
+    if not values or not values[0] or values[0][0] != "Project":
+        sheet.insert_row(COLUMNS, 1)
+
+    row = [data.get(col, "") for col in COLUMNS]
+    sheet.append_row(row)
+
+    # 让 URL 这一列变成可点击超链接
+    url_col_index = COLUMNS.index("URL") + 1
+    row_number = len(sheet.get_all_values())
+
+    clean_url = data.get("URL", "")
+    if clean_url:
+        cell_label = gspread.utils.rowcol_to_a1(row_number, url_col_index)
+        sheet.update_acell(cell_label, f'=HYPERLINK("{clean_url}", "{clean_url}")')
 
 
 def slug_to_name(slug):
@@ -14,7 +83,7 @@ def slug_to_name(slug):
 def get_district(address, mrt, project, text):
     full_text = f"{address} {mrt} {project} {text}".lower()
 
-    # 1) direct sentence extraction first
+    # 先直接抓句子里的 District xx
     m = re.search(r"\bin\s+district\s*(\d{1,2})\b", full_text, re.IGNORECASE)
     if m:
         return f"D{m.group(1)}"
@@ -23,7 +92,7 @@ def get_district(address, mrt, project, text):
     if m:
         return f"D{m.group(1)}"
 
-    # 2) keyword mapping
+    # 关键词映射
     address_map = {
         "D05": [
             "dover rise", "dover", "buona vista", "one-north", "one north",
@@ -35,7 +104,7 @@ def get_district(address, mrt, project, text):
         ],
         "D19": [
             "bartley", "serangoon", "hougang", "kovan", "upper paya lebar",
-            "jalan bunga rampai"
+            "jalan bunga rampai", "poh huat"
         ],
         "D14": [
             "geylang", "eunos", "aljunied", "paya lebar", "kampong eunos"
@@ -86,9 +155,10 @@ def extract(text):
                 return m.group(1).strip()
         return ""
 
-    url = find([
+    raw_url = find([
         r"(https?://[^\s]+)"
     ])
+    url = clean_propertyguru_url(raw_url)
 
     data = {
         "Project": "",
@@ -116,10 +186,10 @@ def extract(text):
             r"(\d+)\s*bath"
         ]),
         "Tenure": find([
-            r"(99[- ]?year leasehold)",
-            r"(99[- ]?year lease)",
             r"(999[- ]?year leasehold)",
             r"(999[- ]?year lease)",
+            r"(99[- ]?year leasehold)",
+            r"(99[- ]?year lease)",
             r"(Freehold(?: tenure)?)",
             r"(Leasehold)"
         ]),
@@ -136,7 +206,10 @@ def extract(text):
             r"(\d+)\s*total units",
             r"comprises of\s+(\d+)\s+units"
         ]),
-        "URL": url
+        "URL": url,
+        "Status": "New",
+        "Viewing Date": "",
+        "Remarks": ""
     }
 
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -154,17 +227,18 @@ def extract(text):
 
     cleaned = [l for l in lines if l.lower() not in junk]
 
-    # project from URL first
+    # 先从 URL 抓 project
     if url:
         m = re.search(r"/for-sale-([a-z0-9\-]+)-\d+", url, re.IGNORECASE)
         if m:
             data["Project"] = slug_to_name(m.group(1))
 
-    # address detection
+    # 地址识别
     address_keywords = [
         "road", "rd", "street", "st", "avenue", "ave", "drive", "dr",
         "rise", "crescent", "lane", "close", "view", "hill", "grove",
-        "place", "park", "boulevard", "way", "jalan", "lorong", "kampong", "eunos"
+        "place", "park", "boulevard", "way", "jalan", "lorong",
+        "kampong", "eunos", "west"
     ]
 
     address = ""
@@ -173,9 +247,9 @@ def extract(text):
     for i, line in enumerate(cleaned):
         lower = line.lower()
         if (
-            re.match(r"^\d+[A-Za-z]?\s+.+", line)
+            re.match(r"^(?:\d+[A-Za-z]?\s+.+|[A-Za-z][A-Za-z\s]+)$", line)
             and any(k in lower for k in address_keywords)
-            and not any(x in lower for x in ["units", "psf", "sqft"])
+            and not any(x in lower for x in ["units", "psf", "sqft", "mrt", "lease", "developer"])
         ):
             address = line
 
@@ -200,7 +274,7 @@ def extract(text):
     if not data["Project"] and project_from_lines:
         data["Project"] = project_from_lines
 
-    # MRT extraction: keep first nearest only, cleaned
+    # MRT：只保留第一个，且清洗成纯站名
     mrt_matches = re.findall(
         r"(?:\d+\s*m\s*\(\d+\s*mins?\)\s*from\s*)?(?:[A-Z]{1,3}\d{1,2}\s+)?([A-Za-z][A-Za-z\s]+MRT)",
         text,
@@ -217,11 +291,11 @@ def extract(text):
     if cleaned_mrts:
         data["Nearest MRT"] = cleaned_mrts[0]
 
-    # clean tenure wording
+    # 清理 tenure
     if data["Tenure"]:
         data["Tenure"] = data["Tenure"].replace(" tenure", "")
 
-    # area mapping
+    # Area
     data["Area"] = get_district(
         data["Address"],
         data["Nearest MRT"],
@@ -241,48 +315,21 @@ if "df_result" not in st.session_state:
 
 if col1.button("Extract"):
     data = extract(text)
-
-    ordered = {
-        "Project": data.get("Project", ""),
-        "Address": data.get("Address", ""),
-        "Area": data.get("Area", ""),
-        "Nearest MRT": data.get("Nearest MRT", ""),
-        "Price": data.get("Price", ""),
-        "Size": data.get("Size", ""),
-        "PSF": data.get("PSF", ""),
-        "Bedrooms": data.get("Bedrooms", ""),
-        "Bathrooms": data.get("Bathrooms", ""),
-        "Tenure": data.get("Tenure", ""),
-        "TOP": data.get("TOP", ""),
-        "Developer": data.get("Developer", ""),
-        "Total Units": data.get("Total Units", ""),
-        "URL": data.get("URL", "")
-    }
-
-    st.session_state.df_result = pd.DataFrame([ordered])
+    ordered = {col: data.get(col, "") for col in COLUMNS}
+    st.session_state.df_result = pd.DataFrame([ordered])[COLUMNS]
 
 if st.session_state.df_result is not None:
     st.dataframe(st.session_state.df_result, use_container_width=True, hide_index=True)
     st.write("Preview (copy):")
     st.code(st.session_state.df_result.to_csv(sep="\t", index=False))
 
-if col2.button("Save to database"):
+if col2.button("Save to Google Sheet"):
     if st.session_state.df_result is None:
         st.warning("Please Extract first")
     else:
-        file = "property_records.csv"
-        new_df = st.session_state.df_result
-
-        if os.path.exists(file):
-            old_df = pd.read_csv(file)
-
-            new_url = str(new_df["URL"].iloc[0]).strip()
-            if new_url and "URL" in old_df.columns and new_url in old_df["URL"].astype(str).values:
-                st.warning("Duplicate found (same URL). Not saved.")
-            else:
-                updated_df = pd.concat([old_df, new_df], ignore_index=True)
-                updated_df.to_csv(file, index=False)
-                st.success("Saved successfully!")
-        else:
-            new_df.to_csv(file, index=False)
-            st.success("Database created and saved!")
+        data = st.session_state.df_result.iloc[0].to_dict()
+        try:
+            save_to_gsheet(data)
+            st.success("Saved to Google Sheet!")
+        except Exception as e:
+            st.error(f"GSheet save failed: {e}")
